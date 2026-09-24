@@ -1,0 +1,583 @@
+{
+  "name": "first workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "pii-scanner",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        304,
+        -528
+      ],
+      "id": "14d5d09a-7fd4-4525-bac2-5001eaa97f95",
+      "name": "Webhook",
+      "webhookId": "8c43ba63-80ec-4b0e-966b-b24d0a6a826a"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-4o-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "id": "a99b4d9d-a005-4635-bdee-9c07a8ddfd55",
+      "name": "OpenAI Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        984,
+        -304
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "fI7s3wJG5guTxBja",
+          "name": "n8n free OpenAI API credits"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\n\n// DEBUG: Let's find where the actual text lives\nlet textToScan = '';\nlet source = 'unknown';\n\n// Check every possible location the text could be\nif (input.body && typeof input.body === 'object' && input.body.text) {\n  // Webhook sends: { headers: {...}, body: { text: \"...\" } }\n  textToScan = input.body.text;\n  source = input.body.source || 'unknown';\n  \n} else if (input.body && typeof input.body === 'string') {\n  // Body is a string — try to parse it\n  try {\n    const parsed = JSON.parse(input.body);\n    textToScan = parsed.text || input.body;\n    source = parsed.source || 'unknown';\n  } catch(e) {\n    textToScan = input.body;\n  }\n  \n} else if (input.text) {\n  // Direct: { text: \"...\" }\n  textToScan = input.text;\n  source = input.source || 'unknown';\n  \n} else if (input.data && typeof input.data === 'string') {\n  textToScan = input.data;\n  source = input.source || 'unknown';\n  \n} else {\n  // LAST RESORT: stringify but EXCLUDE headers/params/query\n  // Only stringify the body\n  const bodyOnly = input.body || input;\n  textToScan = typeof bodyOnly === 'string' ? bodyOnly : JSON.stringify(bodyOnly);\n  source = 'fallback';\n}\n\nconst metadata = {\n  timestamp: new Date().toISOString(),\n  inputLength: textToScan.length,\n  scanId: 'SCAN-' + Date.now() + '-' + Math.random().toString(36).substr(2, 6),\n  source: source\n};\n\nreturn [{\n  json: {\n    originalText: textToScan,\n    metadata: metadata\n  }\n}];"
+      },
+      "id": "dd1afa70-c76b-45c3-8221-f424e6414d17",
+      "name": "Format Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        528,
+        -528
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst text = data.originalText;\n\n// ═══════════════════════════════════════════════\n// NIST SP 800-122 TIER CLASSIFICATION\n// Tier 1: Stand-alone PII (dangerous by itself)\n// Tier 2: Linked PII (dangerous in combination)\n// Tier 3: Quasi-identifiers (contextual risk)\n// ═══════════════════════════════════════════════\n\nconst piiPatterns = {\n  \n  // ─── TIER 1: STAND-ALONE (base_score: 10) ───\n  ssn: {\n    regex: /\\b(\\d{3})[-\\s]?(\\d{2})[-\\s]?(\\d{4})\\b/g,\n    tier: 1,\n    baseScore: 10,\n    severity: 'CRITICAL',\n    category: 'government_id',\n    contextWords: ['ssn', 'social security', 'social sec', 'tax id', 'taxpayer'],\n    validate: (match) => {\n      // SSN validation: exclude known invalid ranges\n      const area = parseInt(match.replace(/[-\\s]/g, '').substring(0, 3));\n      if (area === 0 || area === 666 || area >= 900) return false;\n      const group = parseInt(match.replace(/[-\\s]/g, '').substring(3, 5));\n      if (group === 0) return false;\n      const serial = parseInt(match.replace(/[-\\s]/g, '').substring(5, 9));\n      if (serial === 0) return false;\n      return true;\n    }\n  },\n  \n  \ncredit_card: {\n    regex: /\\b(\\d{4})[-\\s]?(\\d{4})[-\\s]?(\\d{4})[-\\s]?(\\d{4})\\b/g,\n    tier: 1,\n    baseScore: 10,\n    severity: 'CRITICAL',\n    category: 'financial',\n    contextWords: ['credit card', 'card number', 'visa', 'mastercard', 'amex', 'payment card', 'cc'],\n    validate: (match) => {\n      const digits = match.replace(/[-\\s]/g, '');\n      // Must be 16 digits\n      if (digits.length !== 16) return false;\n      \n      // Luhn check (soft) — if context word found, accept anyway\n      let sum = 0;\n      let isEven = false;\n      for (let i = digits.length - 1; i >= 0; i--) {\n        let digit = parseInt(digits[i]);\n        if (isEven) {\n          digit *= 2;\n          if (digit > 9) digit -= 9;\n        }\n        sum += digit;\n        isEven = !isEven;\n      }\n      const luhnValid = (sum % 10 === 0);\n      \n      // Accept if Luhn valid OR if it starts with known card prefixes\n      // Visa: 4, Mastercard: 51-55/2221-2720, Amex: 34/37\n      const prefix = digits.substring(0, 2);\n      const knownPrefix = digits[0] === '4' \n        || (parseInt(prefix) >= 51 && parseInt(prefix) <= 55)\n        || prefix === '34' || prefix === '37'\n        || (parseInt(digits.substring(0,4)) >= 2221 && parseInt(digits.substring(0,4)) <= 2720);\n      \n      // If known prefix, accept even without perfect Luhn\n      // Better to have false positive than miss a real card\n      return luhnValid || knownPrefix;\n    }\n  },\n\n  passport: {\n    regex: /\\b[A-Z]{1,2}\\d{6,9}\\b/g,\n    tier: 1,\n    baseScore: 10,\n    severity: 'CRITICAL',\n    category: 'government_id',\n    contextWords: ['passport', 'travel document', 'passport number'],\n    validate: () => true\n  },\n\n  drivers_license: {\n    regex: /\\b[A-Z]\\d{3}[-\\s]?\\d{4}[-\\s]?\\d{4}\\b/g,\n    tier: 1,\n    baseScore: 10,\n    severity: 'CRITICAL',\n    category: 'government_id',\n    contextWords: ['driver', 'license', 'licence', 'driving', 'dl', \"driver's\"],\n    validate: () => true\n  },\n\n  iban: {\n    regex: /\\b[A-Z]{2}\\d{2}[A-Z0-9]{4}\\d{7}([A-Z0-9]?){0,16}\\b/g,\n    tier: 1,\n    baseScore: 10,\n    severity: 'CRITICAL',\n    category: 'financial',\n    contextWords: ['iban', 'bank account', 'account number', 'wire transfer'],\n    validate: () => true\n  },\n\n  // ─── TIER 2: LINKED PII (base_score: 5) ───\n  email: {\n    regex: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/g,\n    tier: 2,\n    baseScore: 5,\n    severity: 'MEDIUM',\n    category: 'contact',\n    contextWords: ['email', 'e-mail', 'mail', 'contact', 'reach me at', 'send to'],\n    validate: (match) => {\n      // Basic email validation\n      return match.includes('.') && match.indexOf('@') > 0;\n    }\n  },\n\n  phone: {\n    regex: /(\\+?1[-.\\s]?)?\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4}/g,\n    tier: 2,\n    baseScore: 5,\n    severity: 'MEDIUM',\n    category: 'contact',\n    contextWords: ['phone', 'call', 'mobile', 'cell', 'telephone', 'tel', 'contact', 'reach'],\n    validate: (match) => {\n      const digits = match.replace(/\\D/g, '');\n      return digits.length >= 10 && digits.length <= 11;\n    }\n  },\n\n  date_of_birth: {\n    regex: /\\b(?:0[1-9]|1[0-2])[\\/\\-](?:0[1-9]|[12]\\d|3[01])[\\/\\-](?:19|20)\\d{2}\\b/g,\n    tier: 2,\n    baseScore: 5,\n    severity: 'HIGH',\n    category: 'identity',\n    contextWords: ['born', 'birth', 'dob', 'birthday', 'date of birth', 'age'],\n    validate: (match) => {\n      const date = new Date(match);\n      return date instanceof Date && !isNaN(date);\n    }\n  },\n\n  street_address: {\n    regex: /\\b\\d{1,5}\\s[A-Z][a-zA-Z\\s]{2,30}(?:Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Lane|Ln|Road|Rd|Court|Ct|Way|Place|Pl)\\b/g,\n    tier: 2,\n    baseScore: 5,\n    severity: 'MEDIUM',\n    category: 'location',\n    contextWords: ['address', 'live', 'reside', 'located', 'home', 'office'],\n    validate: () => true\n  },\n\n  // ─── TIER 3: QUASI-IDENTIFIERS (base_score: 2) ───\n  ip_address: {\n    regex: /\\b(?:(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)\\.){3}(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)\\b/g,\n    tier: 3,\n    baseScore: 2,\n    severity: 'LOW',\n    category: 'technical',\n    contextWords: ['ip', 'address', 'server', 'connection', 'network'],\n    validate: (match) => {\n      const parts = match.split('.');\n      return parts.every(p => parseInt(p) >= 0 && parseInt(p) <= 255);\n    }\n  },\n\n  zip_code: {\n    regex: /\\b\\d{5}(?:[-\\s]\\d{4})?\\b/g,\n    tier: 3,\n    baseScore: 2,\n    severity: 'LOW',\n    category: 'location',\n    contextWords: ['zip', 'postal', 'code', 'area'],\n    validate: (match) => {\n      const zip = parseInt(match.substring(0, 5));\n      return zip >= 501 && zip <= 99950;\n    }\n  },\n\n  age: {\n    regex: /\\b(?:age[d]?\\s*:?\\s*)?(\\d{1,3})\\s*(?:years?\\s*old|yo|y\\/o)\\b/gi,\n    tier: 3,\n    baseScore: 2,\n    severity: 'LOW',\n    category: 'demographic',\n    contextWords: ['age', 'years old', 'born in', 'elderly', 'minor'],\n    validate: (match) => {\n      const num = parseInt(match.match(/\\d+/)?.[0] || '0');\n      return num > 0 && num < 130;\n    }\n  },\n    // ─── NEW PATTERNS ───\n\n  // Partial SSN\n  partial_ssn: {\n    regex: /(?:ssn|social\\s*security)[\\s\\w]*(?:ending|last\\s*\\d|ends)\\s*(?:in\\s*)?(\\d{4})/gi,\n    tier: 1,\n    baseScore: 10,\n    severity: 'CRITICAL',\n    category: 'government_id',\n    contextWords: ['ssn', 'social security', 'last four'],\n    validate: () => true\n  },\n\n  // Partial Credit Card\n  partial_credit_card: {\n    regex: /(?:credit\\s*card|card|cc|visa|mastercard)[\\s\\w]*(?:ending|last|ends)\\s*(?:in\\s*)?(\\d{4})/gi,\n    tier: 1,\n    baseScore: 10,\n    severity: 'CRITICAL',\n    category: 'financial',\n    contextWords: ['credit card', 'card', 'ending', 'last four'],\n    validate: () => true\n  },\n\n  // Insurance Policy Numbers\n  insurance_id: {\n    regex: /(?:policy|insurance|group)\\s*(?:#|number|num|no\\.?)?\\s*:?\\s*([A-Z]{1,3}[-\\s]?\\d{4,10}[-\\s]?[A-Z0-9]*)/gi,\n    tier: 1,\n    baseScore: 10,\n    severity: 'CRITICAL',\n    category: 'financial',\n    contextWords: ['insurance', 'policy', 'blue cross', 'aetna', 'cigna', 'united', 'group'],\n    validate: () => true\n  },\n\n  // Medical Record Numbers\n  medical_record: {\n    regex: /(?:MR|MRN|record|patient\\s*(?:id|#))[-\\s#:]*\\d{4,}[-\\s]?\\d{0,6}/gi,\n    tier: 1,\n    baseScore: 10,\n    severity: 'CRITICAL',\n    category: 'health',\n    contextWords: ['patient', 'record', 'medical', 'chart'],\n    validate: () => true\n  },\n\n  // Word-format Dates (January 1, 2024 / 1st January 2024)\n  date_word_format: {\n    regex: /\\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2}(?:st|nd|rd|th)?,?\\s*\\d{4}\\b/gi,\n    tier: 2,\n    baseScore: 5,\n    severity: 'MEDIUM',\n    category: 'identity',\n    contextWords: ['born', 'birth', 'dob', 'date', 'on', 'scheduled', 'appointment'],\n    validate: () => true\n  },\n\n  // Medication Names (common medications)\n  medication: {\n    regex: /\\b(?:Metformin|Sertraline|Lisinopril|Atorvastatin|Amlodipine|Omeprazole|Losartan|Gabapentin|Hydrochlorothiazide|Levothyroxine|Metoprolol|Amoxicillin|Azithromycin|Prednisone|Ibuprofen|Acetaminophen|Adderall|Xanax|Oxycodone|Insulin|Warfarin|Clopidogrel)\\s*\\d*\\s*(?:mg|mcg|ml|units?)?\\b/gi,\n    tier: 1,\n    baseScore: 8,\n    severity: 'HIGH',\n    category: 'health',\n    contextWords: ['prescribed', 'medication', 'taking', 'dose', 'drug'],\n    validate: () => true\n  },\n\n  // Dollar Amounts tied to context\n  financial_amount: {\n    regex: /\\$[\\d,]+(?:\\.\\d{2})?(?:\\s*(?:K|M|B|million|billion))?\\b/g,\n    tier: 3,\n    baseScore: 2,\n    severity: 'LOW',\n    category: 'financial',\n    contextWords: ['pay', 'bill', 'charge', 'cost', 'fee', 'salary', 'offer', 'wire', 'transfer', 'collected'],\n    validate: () => true\n  },\n\n  // Employee/Badge/Record IDs\n  employee_id: {\n    regex: /(?:employee|emp|badge|staff)\\s*(?:id|#|number|no\\.?)?\\s*:?\\s*([A-Z]{1,4}[-]?\\d{4,10})/gi,\n    tier: 2,\n    baseScore: 5,\n    severity: 'MEDIUM',\n    category: 'identity',\n    contextWords: ['employee', 'badge', 'staff', 'worker'],\n    validate: () => true\n  },\n  // Pattern 1: US City + State\nus_city_state: {\n  regex: /\\b[A-Z][a-z]+(?:\\s[A-Z][a-z]+)?,\\s*(?:Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New\\s+Hampshire|New\\s+Jersey|New\\s+Mexico|New\\s+York|North\\s+Carolina|North\\s+Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode\\s+Island|South\\s+Carolina|South\\s+Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West\\s+Virginia|Wisconsin|Wyoming)\\b/g,\n  tier: 3,\n  baseScore: 2,\n  severity: 'LOW',\n  category: 'location',\n  contextWords: ['born', 'from', 'live', 'reside', 'moved', 'hometown', 'raised', 'grew up', 'native'],\n  validate: () => true\n},\n\n// Pattern 2: Doctor Names\ndoctor_name: {\n  regex: /\\bDr\\.?\\s+[A-Z][a-z]+(?:\\s+[A-Z][a-z]+)?\\b/g,\n  tier: 2,\n  baseScore: 5,\n  severity: 'MEDIUM',\n  category: 'identity',\n  contextWords: ['physician', 'doctor', 'care', 'appointment', 'scheduled', 'clinic', 'hospital', 'medical'],\n  validate: () => true\n},\n\n// Pattern 3: Job Titles\njob_title: {\n  regex: /\\b(?:senior|junior|lead|chief|head|principal|staff|associate|assistant)?\\s*(?:software engineer|data scientist|product manager|project manager|developer|analyst|consultant|director|manager|engineer|architect|designer|administrator|coordinator|specialist|technician|surgeon|physician|nurse|attorney|accountant|professor)\\b/gi,\n  tier: 3,\n  baseScore: 2,\n  severity: 'LOW',\n  category: 'professional',\n  contextWords: ['works as', 'position', 'role', 'title', 'employed', 'job', 'occupation', 'hired as'],\n  validate: () => true\n}\n};\n\n// ═══════════════════════════════════��═══════════\n// DETECTION WITH CONTEXT BOOSTING\n// Presidio-inspired: check for context words\n// within 50 characters before/after the match\n// ═══════════════════════════════════════════════\n\nlet findings = [];\nconst textLower = text.toLowerCase();\n\nfor (const [piiType, config] of Object.entries(piiPatterns)) {\n  let match;\n  const regex = new RegExp(config.regex.source, config.regex.flags);\n  \n  while ((match = regex.exec(text)) !== null) {\n    const value = match[0];\n    const position = match.index;\n    \n    // VALIDATION CHECK\n    let isValid = true;\n    try {\n      isValid = config.validate(value);\n    } catch(e) {\n      isValid = true; // If validation fails, assume valid (safe side)\n    }\n    \n    if (!isValid) continue;\n    \n    // CONTEXT BOOSTING (Presidio-style)\n    // Look 50 chars before and after the match for context words\n    const windowStart = Math.max(0, position - 50);\n    const windowEnd = Math.min(textLower.length, position + value.length + 50);\n    const contextWindow = textLower.substring(windowStart, windowEnd);\n    \n    let contextBoost = 0;\n    let contextWordFound = '';\n    \n    for (const cw of config.contextWords) {\n      if (contextWindow.includes(cw.toLowerCase())) {\n        contextBoost = 0.15;\n        contextWordFound = cw;\n        break;\n      }\n    }\n    \n    // BASE CONFIDENCE\n    let confidence = 0.70; // default regex confidence\n    confidence += contextBoost; // +0.15 if context word found\n    confidence = Math.min(confidence, 0.99);\n    \n    findings.push({\n      type: piiType,\n      value: value,\n      tier: config.tier,\n      baseScore: config.baseScore,\n      severity: config.severity,\n      category: config.category,\n      detectedBy: 'regex',\n      confidence: parseFloat(confidence.toFixed(2)),\n      contextBoost: contextBoost,\n      contextWord: contextWordFound,\n      position: position,\n      validated: true\n    });\n  }\n}\n\n// Remove exact duplicates by value\nconst seen = new Set();\nfindings = findings.filter(f => {\n  const key = f.type + ':' + f.value;\n  if (seen.has(key)) return false;\n  seen.add(key);\n  return true;\n});\n\nreturn [{\n  json: {\n    originalText: data.originalText,\n    metadata: data.metadata,\n    regexFindings: findings,\n    regexFindingsCount: findings.length,\n    regexScanComplete: true\n  }\n}];"
+      },
+      "id": "0194b00b-4fad-4bdc-8f96-702f2bfbe2b3",
+      "name": "Regex PII Scanner",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        752,
+        -528
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Analyze this text for PII:\n\n{{ $json.originalText }}",
+        "options": {
+          "systemMessage": "You are an expert PII (Personally Identifiable Information) detection engine based on NIST SP 800-122 standards.\n\nYour job: Find ALL sensitive data that pattern-matching would miss. Focus on CONTEXTUAL and SEMANTIC PII.\n\nCLASSIFICATION TIERS (NIST SP 800-122):\n\nTIER 1 — Stand-alone PII (dangerous alone, base_score=10):\n  Government IDs, biometric data, medical record numbers, financial account numbers, authentication credentials\n\nTIER 2 — Linked PII (dangerous in combination, base_score=5):\n  Full names, email addresses, phone numbers, dates of birth, physical addresses, employer + job title combos\n\nTIER 3 — Quasi-identifiers (contextual risk, base_score=2):\n  ZIP codes, gender, age ranges, race/ethnicity, education history, general location references\n\nSPECIAL DETECTION TARGETS (regex cannot catch these):\n  - Full person names (first + last)\n  - Partial names with context (\"Mr. Johnson called\")\n  - Organization names linked to individuals\n  - Medical conditions or diagnoses\n  - Religious, political, sexual orientation data (GDPR special category)\n  - Biometric descriptions (\"tall woman with red hair\")\n  - Contextual identification (\"the only dentist in Springfield\")\n  - Indirect identifiers (\"my husband who works at Google\")\n  - Genetic or health data\n  - Criminal history references\n  - Immigration status\n\nCRITICAL ITEMS YOU MUST DETECT (commonly missed):\n\n1. NAMES IN ALL FORMS:\n   - Nicknames in parentheses: \"(preferred name: Jenny)\" → Jenny is PII\n   - Doctor names: \"Dr. Alexander Chen\" → PII\n   - Names with titles: \"Mrs.\", \"Mr.\", \"Dr.\"\n   - Second mentions: If \"Dr. Chen\" appears again, flag it too\n\n2. DATES IN ALL FORMATS:\n   - \"August 23, 1985\" → DOB in word format\n   - \"May 15, 2024\" → appointment date\n   - \"March 8th\" → date reference\n   - Any date tied to a person is PII\n\n3. PARTIAL IDENTIFIERS (VERY IMPORTANT):\n   - \"SSN ending in 7823\" → CRITICAL even though partial\n   - \"credit card ending 4421\" → CRITICAL even though partial\n   - Any partial ID number is still PII\n\n4. MEDICAL DATA (HIPAA):\n   - Medication names + dosages: \"Metformin 1000mg\" → PII\n   - Lab results: \"A1C level 8.2%\" → PII\n   - Diagnoses: already covered\n   - Medical facility names: \"Rainier Valley clinic\" → PII\n   - Doctor/physician names → PII\n   - Medical record numbers: \"MR-2024-45891\" → PII\n\n5. INSURANCE DATA:\n   - Policy numbers: \"BC-992841-X\" → PII\n   - Group numbers: \"GRP-441\" → PII\n   - Insurance company tied to patient → PII\n\n6. FINANCIAL DATA TIED TO INDIVIDUALS:\n   - \"\\$45 co-pay\" → financial amount tied to patient\n   - \"\\$1,247.50 billed\" → financial amount tied to patient\n   \n7. LOCATIONS TIED TO INDIVIDUALS:\n   - \"Portland, Oregon\" (birthplace) → PII\n   - \"Rainier Valley clinic\" (medical facility) → PII\n   - \"Northwest Medical Associates\" → medical org → PII\n\n8. ORGANIZATION NAMES:\n   - Medical organizations tied to patient care\n   - Employer names (already covered)\n\n9. BIRTH/ORIGIN LOCATIONS:\n   - \"born in Portland, Oregon\" → the city and state are PII \n     when tied to a specific person's birth\n   - Any city/state/country mentioned as someone's origin, \n     birthplace, or hometown = PII\n   - Flag the location portion: \"Portland, Oregon\"\n\n10. INSURANCE COMPANY NAMES TIED TO PATIENTS:\n    - \"Blue Cross\", \"Aetna\", \"Cigna\", \"UnitedHealthcare\" etc.\n    - When tied to a specific patient, the company name itself \n      is PII under HIPAA (reveals insurance relationship)\n    - Flag: \"Blue Cross\" separately from the policy number\n\n11. PHYSICAL BIOMETRIC DESCRIPTIONS:\n    - Height: \"5 feet 6 inches\", \"5'6\\\"\", \"170cm\"\n    - Weight: \"165 lbs\", \"75 kg\"  \n    - Physical descriptions: \"tall\", \"heavyset\"\n    - These are BIOMETRIC identifiers under GDPR Article 9\n    - Flag the FULL physical description as one unit\n    - \"5 feet 6 inches, approximately 165 lbs\" = one biometric finding\n\nRESPOND ONLY IN THIS EXACT JSON FORMAT:\n{\n  \"findings\": [\n    {\n      \"type\": \"person_name|full_address|medical_data|organization_link|special_category|indirect_identifier|biometric|contextual_id\",\n      \"value\": \"exact text from input\",\n      \"tier\": 1 or 2 or 3,\n      \"baseScore\": 10 or 5 or 2,\n      \"severity\": \"LOW|MEDIUM|HIGH|CRITICAL\",\n      \"category\": \"identity|health|financial|location|demographic|special_category|professional\",\n      \"confidence\": 0.0 to 1.0,\n      \"reasoning\": \"why this is PII and why this confidence level\"\n    }\n  ],\n  \"contextualRisks\": [\n    \"description of any re-identification risk even after individual items are masked\"\n  ],\n  \"summary\": \"brief overall assessment\"\n}\n\nCONFIDENCE GUIDELINES:\n  0.9-1.0: Definitely PII, clear context\n  0.7-0.89: Very likely PII, strong indicators\n  0.5-0.69: Possibly PII, some ambiguity\n  Below 0.5: Don't include it\n\nBe thorough. Err on the side of caution. If in doubt, flag it.\nDo NOT repeat items that are obvious patterns (emails, phone numbers, SSNs) — those are caught by regex. Focus on what REGEX MISSES."
+        }
+      },
+      "id": "b7ce1d85-25a2-4e0a-a197-90fcc2a8a534",
+      "name": "AI PII Analyzer",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        976,
+        -528
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\n\n// Get data from Regex Scanner node\nconst regexData = $(\"Regex PII Scanner\").first().json;\nconst originalText = regexData.originalText || \"\";\nconst metadata = regexData.metadata || {};\nconst regexFindings = regexData.regexFindings || [];\n\n// Parse AI response\nlet aiResponse = { findings: [], contextualRisks: [], summary: \"\" };\n\ntry {\n  // AI Agent with structured output parser returns data in \"output\" field\n  if (data.output && typeof data.output === \"object\") {\n    aiResponse = data.output;\n  } else if (typeof data.output === \"string\") {\n    aiResponse = JSON.parse(data.output);\n  } else if (data.findings) {\n    // Already parsed\n    aiResponse = data;\n  }\n} catch (e) {\n  console.log(\"AI parsing error:\", e.message);\n  aiResponse = { findings: [], contextualRisks: [], summary: \"Parse failed: \" + e.message };\n}\n\nconst aiFindings = (aiResponse.findings || []).map(f => ({\n  type: f.type || \"unknown\",\n  value: f.value || \"\",\n  tier: f.tier || 2,\n  baseScore: f.baseScore || 5,\n  severity: f.severity || \"MEDIUM\",\n  category: f.category || \"identity\",\n  detectedBy: \"ai_llm\",\n  confidence: f.confidence || 0.75,\n  contextBoost: 0,\n  contextWord: \"\",\n  position: -1,\n  validated: true,\n  reasoning: f.reasoning || \"\"\n}));\n\nreturn [{\n  json: {\n    originalText: originalText,\n    metadata: metadata,\n    regexFindings: regexFindings,\n    aiFindings: aiFindings,\n    contextualRisks: aiResponse.contextualRisks || [],\n    aiSummary: aiResponse.summary || \"\"\n  }\n}];"
+      },
+      "id": "14f8ccbb-a014-40c8-b77a-9d1b056b69f9",
+      "name": "Parse AI Findings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1328,
+        -528
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\n\n// ═══════════════════════════════════════════════════════════\n//  CPRS — COMPOSITE PRIVACY RISK SCORE\n//  Based on: NIST 800-122, Sweeney Mosaic Effect,\n//  Microsoft Presidio, FAIR Framework\n// ═══════════════════════════════════════════════════════════\n\n// STEP 0: Combine and deduplicate all findings\n// ─────────────────────────────────────────────\nconst allFindings = [\n  ...(data.regexFindings || []),\n  ...(data.aiFindings || [])\n];\n\nconst seen = new Map();\nconst uniqueFindings = [];\n\nallFindings.forEach(f => {\n  const key = (f.value || '').toLowerCase().trim();\n  if (key.length === 0) return;\n  \n  if (seen.has(key)) {\n    // DUAL DETECTION BONUS: Found by both regex AND AI\n    const existing = seen.get(key);\n    if (existing.detectedBy !== f.detectedBy) {\n      existing.confidence = Math.min((existing.confidence || 0.7) + 0.10, 0.99);\n      existing.detectedBy = 'both_regex_and_ai';\n      existing.dualDetection = true;\n    }\n  } else {\n    const finding = { ...f, dualDetection: false };\n    seen.set(key, finding);\n    uniqueFindings.push(finding);\n  }\n});\n\n// ═══════════════════════════════════════════════════════════\n// STEP 1: INDIVIDUAL SCORING (NIST-based + Confidence)\n// \n// Formula: adjusted_score = base_score × confidence\n// ═══════════════════════════════════════════════════════════\n\nuniqueFindings.forEach(f => {\n  const base = f.baseScore || 5;\n  const conf = f.confidence || 0.7;\n  f.adjustedScore = parseFloat((base * conf).toFixed(2));\n});\n\n// ═══════════════════════════════════════════════════════════\n// STEP 2: MOSAIC EFFECT ANALYSIS (Sweeney, 2000)\n//\n// Checks how combinations of PII create compounding risk.\n// Key insight: Individual items may be low risk, but\n// COMBINATIONS enable re-identification\n// ═══════════════════════════════════════════════════════════\n\nconst categoriesFound = new Set();\nconst tiersFound = new Set();\nconst categoryGroups = {};\n\nuniqueFindings.forEach(f => {\n  const cat = f.category || 'unknown';\n  const tier = f.tier || 2;\n  categoriesFound.add(cat);\n  tiersFound.add(tier);\n  if (!categoryGroups[cat]) categoryGroups[cat] = [];\n  categoryGroups[cat].push(f);\n});\n\n// Mosaic multiplier based on category diversity\nlet mosaicMultiplier = 1.0;\nconst numCategories = categoriesFound.size;\n\nif (numCategories === 1) mosaicMultiplier = 1.0;\nelse if (numCategories === 2) mosaicMultiplier = 1.5;\nelse if (numCategories === 3) mosaicMultiplier = 2.5;\nelse if (numCategories === 4) mosaicMultiplier = 3.5;\nelse mosaicMultiplier = 4.0;\n\n// ═══════════════════════════════════════════════════════════\n// STEP 3: IDENTITY THEFT KIT DETECTION\n//\n// Sweeney showed: Name + DOB + ZIP = uniquely identifies 87%\n// We check for dangerous COMBINATIONS\n// ═══════════════════════════════════════════════════════════\n\nconst hasName = uniqueFindings.some(f => \n  ['person_name'].includes(f.type) || f.category === 'identity');\nconst hasGovernmentId = uniqueFindings.some(f => \n  ['ssn', 'passport', 'drivers_license'].includes(f.type) || f.category === 'government_id');\nconst hasFinancial = uniqueFindings.some(f => \n  ['credit_card', 'iban'].includes(f.type) || f.category === 'financial');\nconst hasContact = uniqueFindings.some(f => \n  ['email', 'phone', 'street_address'].includes(f.type) || f.category === 'contact');\nconst hasDOB = uniqueFindings.some(f => \n  ['date_of_birth'].includes(f.type));\nconst hasLocation = uniqueFindings.some(f => \n  f.category === 'location');\nconst hasMedical = uniqueFindings.some(f => \n  f.category === 'health' || f.type === 'medical_data');\n\nlet identityTheftKit = false;\nlet identityTheftReason = '';\n\n// CHECK 1: Full Identity Theft Kit\nif (hasName && hasGovernmentId && hasFinancial) {\n  identityTheftKit = true;\n  mosaicMultiplier = 5.0;\n  identityTheftReason = 'CRITICAL: Name + Government ID + Financial data = Complete identity theft kit';\n}\n// CHECK 2: Sweeney's 87% re-identification combo\nelse if (hasName && hasDOB && hasLocation) {\n  mosaicMultiplier = Math.max(mosaicMultiplier, 4.0);\n  identityTheftReason = 'HIGH: Name + DOB + Location = 87% re-identification risk (Sweeney 2000)';\n}\n// CHECK 3: Contact + Identity combo\nelse if (hasName && hasContact && hasGovernmentId) {\n  identityTheftKit = true;\n  mosaicMultiplier = 5.0;\n  identityTheftReason = 'CRITICAL: Name + Contact info + Government ID = Full identity exposure';\n}\n// CHECK 4: Medical identity\nelse if (hasName && hasMedical) {\n  mosaicMultiplier = Math.max(mosaicMultiplier, 4.5);\n  identityTheftReason = 'CRITICAL: Name + Medical data = HIPAA violation risk';\n}\n\n// ═══════════════════════════════════════════════════════════\n// STEP 4: VOLUME FACTOR\n//\n// More PII items = higher risk (not linear — logarithmic)\n// 1 item is bad, 10 items is catastrophic, but 100 vs 200\n// is roughly the same catastrophe level\n// ═══════════════════════════════════════════════════════════\n\nconst itemCount = uniqueFindings.length;\nlet volumeFactor;\n\nif (itemCount === 0) volumeFactor = 0;\nelse if (itemCount <= 2) volumeFactor = 1.0;\nelse if (itemCount <= 5) volumeFactor = 1.2;\nelse if (itemCount <= 10) volumeFactor = 1.4;\nelse volumeFactor = 1.0 + (Math.log10(itemCount) * 0.3);\n\n// ═══════════════════════════════════════════════════════════\n// STEP 5: CALCULATE FINAL CPRS SCORE\n//\n// CPRS = normalize(\n//   Σ(adjusted_scores) × mosaic_multiplier × volume_factor\n// )\n// ═══════════════════════════════════════════════════════════\n\nconst rawSum = uniqueFindings.reduce((sum, f) => sum + (f.adjustedScore || 0), 0);\nconst compositeRaw = rawSum * mosaicMultiplier * volumeFactor;\n\n// Normalize to 0-100 scale\n// Max realistic scenario: 10 Tier-1 items × conf 0.95 × mosaic 5.0 × volume 1.4\n// = 10 × 9.5 × 5.0 × 1.4 = 665\nconst MAX_THRESHOLD = 200; // Calibrated so common scenarios spread well across 0-100\nconst normalizedScore = Math.min(Math.round((compositeRaw / MAX_THRESHOLD) * 100), 100);\n\n// ═══════════════════════════════════════════════════════════\n// STEP 6: DETERMINE RISK LEVEL\n// ═══════════════════════════════════════════════════════════\n\nlet riskLevel;\nlet riskEmoji;\nlet riskAction;\n\nif (normalizedScore === 0) {\n  riskLevel = 'CLEAN';\n  riskEmoji = '🟢';\n  riskAction = 'No action needed. Data is clean.';\n} else if (normalizedScore <= 15) {\n  riskLevel = 'LOW';\n  riskEmoji = '🟡';\n  riskAction = 'Log only. Minor quasi-identifiers detected.';\n} else if (normalizedScore <= 40) {\n  riskLevel = 'MEDIUM';\n  riskEmoji = '🟠';\n  riskAction = 'Mask PII before sending to external services.';\n} else if (normalizedScore <= 70) {\n  riskLevel = 'HIGH';\n  riskEmoji = '🔴';\n  riskAction = 'Full masking required. Review data handling. Alert security team.';\n} else {\n  riskLevel = 'CRITICAL';\n  riskEmoji = '🚨';\n  riskAction = 'BLOCK DATA FLOW. Full redaction. Immediate security review required.';\n}\n\n// Force CRITICAL if identity theft kit detected\nif (identityTheftKit && riskLevel !== 'CRITICAL') {\n  riskLevel = 'CRITICAL';\n  riskEmoji = '🚨';\n  riskAction = 'IDENTITY THEFT KIT DETECTED. Block all data flow. Immediate action required.';\n}\n\n// ═══════════════════════════════════════════════════════════\n// STEP 7: BUILD SCORE BREAKDOWN (for transparency)\n// ═══════════════════════════════════════════════════════════\n\nconst scoreBreakdown = {\n  algorithm: 'CPRS v2.0 (Composite Privacy Risk Score)',\n  references: [\n    'NIST SP 800-122',\n    'Sweeney 2000 (Mosaic Effect)',\n    'Microsoft Presidio (Context Boosting)',\n    'FAIR Framework (Risk Quantification)'\n  ],\n  components: {\n    rawSumOfAdjustedScores: parseFloat(rawSum.toFixed(2)),\n    mosaicMultiplier: mosaicMultiplier,\n    mosaicReason: `${numCategories} distinct PII categories detected`,\n    volumeFactor: parseFloat(volumeFactor.toFixed(2)),\n    volumeReason: `${itemCount} unique PII items`,\n    compositeRaw: parseFloat(compositeRaw.toFixed(2)),\n    normalizedScore: normalizedScore,\n    maxThreshold: MAX_THRESHOLD\n  },\n  identityTheftKit: {\n    detected: identityTheftKit,\n    reason: identityTheftReason || 'No dangerous combinations detected',\n    hasName: hasName,\n    hasGovernmentId: hasGovernmentId,\n    hasFinancial: hasFinancial,\n    hasContact: hasContact,\n    hasDOB: hasDOB,\n    hasLocation: hasLocation,\n    hasMedical: hasMedical\n  },\n  categoriesDetected: Array.from(categoriesFound),\n  tiersDetected: Array.from(tiersFound).sort()\n};\n\n// ═══════════════════════════════════════════════════════════\n// STEP 8: ASSIGN MASKING STRATEGY PER FINDING\n// ═══════════════════════════════════════════════════════════\n\nuniqueFindings.forEach(f => {\n  if (f.tier === 1 || riskLevel === 'CRITICAL') {\n    f.maskingStrategy = 'full_redact';\n  } else if (f.tier === 2 && normalizedScore > 40) {\n    f.maskingStrategy = 'full_redact';\n  } else if (f.tier === 2) {\n    f.maskingStrategy = 'partial_mask';\n  } else {\n    f.maskingStrategy = normalizedScore > 60 ? 'full_redact' : 'tag_only';\n  }\n});\n\nreturn [{\n  json: {\n    originalText: data.originalText,\n    metadata: data.metadata,\n    findings: uniqueFindings,\n    totalFindings: uniqueFindings.length,\n    \n    // CPRS Score\n    cprsScore: normalizedScore,\n    riskLevel: riskLevel,\n    riskEmoji: riskEmoji,\n    riskAction: riskAction,\n    \n    // Full breakdown for audit\n    scoreBreakdown: scoreBreakdown,\n    \n    // Context from AI\n    contextualRisks: data.contextualRisks || [],\n    aiSummary: data.aiSummary,\n    \n    // Legacy compatibility\n    riskScore: normalizedScore,\n    riskPercentage: normalizedScore,\n    findingsByCategory: categoryGroups\n  }\n}];"
+      },
+      "id": "cefe652e-afc4-478a-8a68-081f33d8e6a8",
+      "name": "Merge & Score Findings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1552,
+        -528
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.totalFindings }}",
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              },
+              "rightValue": 0,
+              "id": "bd573477-a9ae-454f-b71c-de7be5a2023f"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5acc2122-8eb7-4323-911e-7a12bb515d29",
+      "name": "Needs Masking?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1776,
+        -528
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nlet maskedText = data.originalText;\n\nconst tokenMap = {};\nlet tokenCounter = 0;\n\n// ═══════════════════════════════════════════════════════════\n// MASKING ENGINE v2\n// Uses the masking strategy assigned by the scoring algorithm\n// Supports: full_redact, partial_mask, hash, tag_only\n// ═══════════════════════════════════════════════════════════\n\n// Sort findings by position (descending) to avoid offset issues\n// For AI findings without position, put them last\nconst sortedFindings = [...data.findings].sort((a, b) => {\n  const lenA = (a.value || '').length;\n  const lenB = (b.value || '').length;\n  // Longest first — prevents short matches breaking long ones\n  if (lenB !== lenA) return lenB - lenA;\n  // If same length, higher tier first (more important)\n  if ((b.tier || 2) !== (a.tier || 2)) return (a.tier || 2) - (b.tier || 2);\n  // If same tier, by position descending\n  const posA = a.position >= 0 ? a.position : 999999;\n  const posB = b.position >= 0 ? b.position : 999999;\n  return posB - posA;\n});\n\n// Generate consistent hash for reversible tokenization\nfunction simpleHash(str) {\n  let hash = 0;\n  for (let i = 0; i < str.length; i++) {\n    const char = str.charCodeAt(i);\n    hash = ((hash << 5) - hash) + char;\n    hash = hash & hash; // Convert to 32bit integer\n  }\n  return Math.abs(hash).toString(36).substring(0, 8);\n}\n\nsortedFindings.forEach(finding => {\n  tokenCounter++;\n  const paddedNum = String(tokenCounter).padStart(3, '0');\n  const typeLabel = finding.type.toUpperCase();\n  const token = `[${typeLabel}_${paddedNum}]`;\n  const strategy = finding.maskingStrategy || 'full_redact';\n  \n  let replacement;\n  \n  switch(strategy) {\n    \n    case 'full_redact':\n      // Complete replacement with token\n      // Used for: Tier 1, or any PII when risk is HIGH/CRITICAL\n      replacement = token;\n      break;\n    \n    case 'partial_mask':\n      // Show first and last character, mask middle\n      // Used for: Tier 2 when risk is MEDIUM\n      const val = finding.value;\n      if (val.includes('@')) {\n        // Email: j***@g***\n        const [local, domain] = val.split('@');\n        const maskedLocal = local[0] + '***';\n        const maskedDomain = domain[0] + '***';\n        replacement = maskedLocal + '@' + maskedDomain;\n      } else if (val.length > 6) {\n        replacement = val.substring(0, 2) + '*'.repeat(val.length - 4) + val.substring(val.length - 2);\n      } else if (val.length > 2) {\n        replacement = val[0] + '*'.repeat(val.length - 2) + val[val.length - 1];\n      } else {\n        replacement = token;\n      }\n      break;\n    \n    case 'hash':\n      // Replace with deterministic hash (same input = same hash)\n      // Useful for: analytics where you need to track unique entities\n      replacement = `[HASH_${simpleHash(finding.value)}]`;\n      break;\n    \n    case 'tag_only':\n      // Wrap with XML tags but keep visible\n      // Used for: Tier 3 quasi-identifiers in LOW risk scenarios\n      replacement = `<pii type=\"${finding.type}\">${finding.value}</pii>`;\n      break;\n    \n    default:\n      replacement = token;\n  }\n  \n  // Store the mapping for potential de-tokenization\n  tokenMap[token] = {\n    original: finding.value,\n    type: finding.type,\n    tier: finding.tier,\n    severity: finding.severity,\n    category: finding.category,\n    confidence: finding.confidence,\n    maskedWith: replacement,\n    strategy: strategy,\n    tokenId: paddedNum\n  };\n  \n  // Apply masking to text\n  if (finding.value && finding.value.length > 0) {\n    maskedText = maskedText.split(finding.value).join(replacement);\n  }\n});\n\n// ═══════════════════════════════════════════════════════════\n// POST-MASKING VERIFICATION\n// Check if the masked text still contains any raw PII values\n// (Safety net — catches edge cases)\n// ═══════════════════════════════════════════════════════════\n\nlet leakCheck = [];\nsortedFindings.forEach(f => {\n  if (f.maskingStrategy === 'tag_only') return; // Tags are intentional\n  if (maskedText.includes(f.value)) {\n    leakCheck.push({\n      type: f.type,\n      value: f.value.substring(0, 3) + '***',\n      status: 'LEAK_DETECTED'\n    });\n    // Force redact any leaks\n    maskedText = maskedText.split(f.value).join(`[${f.type.toUpperCase()}_FORCED]`);\n  }\n});\n\nreturn [{\n  json: {\n    originalText: data.originalText,\n    maskedText: maskedText,\n    tokenMap: tokenMap,\n    metadata: data.metadata,\n    findings: data.findings,\n    totalFindings: data.totalFindings,\n    cprsScore: data.cprsScore,\n    riskLevel: data.riskLevel,\n    riskEmoji: data.riskEmoji,\n    riskAction: data.riskAction,\n    scoreBreakdown: data.scoreBreakdown,\n    contextualRisks: data.contextualRisks,\n    findingsByCategory: data.findingsByCategory,\n    maskingApplied: true,\n    tokensGenerated: tokenCounter,\n    leakCheck: leakCheck,\n    leaksFound: leakCheck.length,\n    maskingVerified: leakCheck.length === 0\n  }\n}];"
+      },
+      "id": "c0c74a21-e0c4-42ef-b925-d35f22e7943c",
+      "name": "Apply PII Masking",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        -672
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\n\nreturn [{\n  json: {\n    success: true,\n    scanId: data.metadata.scanId,\n    riskLevel: 'CLEAN',\n    riskEmoji: '🟢',\n    cprsScore: 0,\n    sanitizedText: data.originalText,\n    piiDetected: 0,\n    recommendedAction: 'No action needed. Data is clean.',\n    message: '✅ No PII detected. Text is clean. CPRS Score: 0/100.',\n    auditReport: {\n      reportId: data.metadata.scanId,\n      reportVersion: 'CPRS v2.0',\n      timestamp: data.metadata.timestamp,\n      score: {\n        cprsScore: 0,\n        riskLevel: 'CLEAN'\n      },\n      detection: {\n        totalPiiFound: 0\n      }\n    },\n    compliance: {\n      gdprRelevant: false,\n      hipaaRelevant: false,\n      pciRelevant: false,\n      ccpaRelevant: false,\n      identityTheftRisk: false\n    }\n  }\n}];"
+      },
+      "id": "a7175f83-8a0a-414a-adb6-345434ed875c",
+      "name": "Clean — No PII",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        -480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\n\nconst auditReport = {\n  \n  // ─── REPORT HEADER ───\n  reportId: data.metadata.scanId,\n  reportVersion: 'CPRS v2.0',\n  timestamp: data.metadata.timestamp,\n  source: data.metadata.source,\n  inputCharacterCount: data.metadata.inputLength,\n  \n  // ─── CPRS SCORE ───\n  score: {\n    cprsScore: data.cprsScore,\n    riskLevel: data.riskLevel,\n    riskEmoji: data.riskEmoji,\n    recommendedAction: data.riskAction,\n    algorithmUsed: 'Composite Privacy Risk Score v2.0',\n    academicBasis: [\n      'NIST SP 800-122 (PII Classification)',\n      'Sweeney 2000 (Mosaic Effect / Re-identification)',\n      'Microsoft Presidio (Context-boosted Detection)',\n      'FAIR Framework (Risk Quantification)',\n      'ISO 27701 (Privacy Information Management)'\n    ]\n  },\n  \n  // ─── SCORE BREAKDOWN (transparency) ───\n  scoreBreakdown: data.scoreBreakdown,\n  \n  // ─── DETECTION SUMMARY ───\n  detection: {\n    totalPiiFound: data.totalFindings,\n    findingsByTier: { tier1: 0, tier2: 0, tier3: 0 },\n    findingsBySeverity: { LOW: 0, MEDIUM: 0, HIGH: 0, CRITICAL: 0 },\n    findingsByCategory: {},\n    findingsByDetector: { regex: 0, ai_llm: 0, both: 0 }\n  },\n  \n  // ─── MASKING SUMMARY ───\n  masking: {\n    applied: data.maskingApplied,\n    tokensGenerated: data.tokensGenerated,\n    verified: data.maskingVerified,\n    leaksFound: data.leaksFound,\n    strategiesUsed: {}\n  },\n  \n  // ─── CONTEXTUAL RISKS (from AI) ───\n  contextualRisks: data.contextualRisks || [],\n  \n  // ─── DETAILED FINDINGS (sanitized — no raw PII in logs!) ───\n  detailedFindings: (data.findings || []).map(f => ({\n    type: f.type,\n    tier: f.tier,\n    severity: f.severity,\n    category: f.category,\n    detectedBy: f.detectedBy,\n    confidence: f.confidence,\n    adjustedScore: f.adjustedScore,\n    maskingStrategy: f.maskingStrategy,\n    dualDetection: f.dualDetection || false,\n    // NEVER log the actual PII value — only a safe preview\n    valuePreview: (f.value || '').substring(0, 2) + '***',\n    valueLength: (f.value || '').length\n  })),\n  \n  // ─── COMPLIANCE FLAGS ───\n  complianceFlags: {\n    gdprRelevant: data.totalFindings > 0,\n    hipaaRelevant: (data.findings || []).some(f => f.category === 'health'),\n    pciRelevant: (data.findings || []).some(f => f.category === 'financial'),\n    ccpaRelevant: data.totalFindings > 0,\n    identityTheftRisk: data.scoreBreakdown?.identityTheftKit?.detected || false\n  }\n};\n\n// Populate counts\n(data.findings || []).forEach(f => {\n  // By tier\n  const tierKey = 'tier' + (f.tier || 2);\n  auditReport.detection.findingsByTier[tierKey] = \n    (auditReport.detection.findingsByTier[tierKey] || 0) + 1;\n  \n  // By severity\n  if (auditReport.detection.findingsBySeverity[f.severity] !== undefined) {\n    auditReport.detection.findingsBySeverity[f.severity]++;\n  }\n  \n  // By category\n  const cat = f.category || 'unknown';\n  auditReport.detection.findingsByCategory[cat] = \n    (auditReport.detection.findingsByCategory[cat] || 0) + 1;\n  \n  // By detector\n  if (f.detectedBy === 'both_regex_and_ai') {\n    auditReport.detection.findingsByDetector.both++;\n  } else if (f.detectedBy === 'ai_llm') {\n    auditReport.detection.findingsByDetector.ai_llm++;\n  } else {\n    auditReport.detection.findingsByDetector.regex++;\n  }\n  \n  // Masking strategies\n  const strat = f.maskingStrategy || 'unknown';\n  auditReport.masking.strategiesUsed[strat] = \n    (auditReport.masking.strategiesUsed[strat] || 0) + 1;\n});\n\nreturn [{\n  json: {\n    maskedText: data.maskedText,\n    auditReport: auditReport,\n    tokenMap: data.tokenMap || {},\n    riskLevel: data.riskLevel,\n    cprsScore: data.cprsScore,\n    riskEmoji: data.riskEmoji\n  }\n}];"
+      },
+      "id": "7729f015-711f-4ace-84db-e9c1c7c98472",
+      "name": "Audit Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2224,
+        -672
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.riskLevel }}",
+                    "rightValue": "CRITICAL",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "5503d6c5-7b82-4684-bee1-7a3878a97aba"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "CRITICAL"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.riskLevel }}",
+                    "rightValue": "HIGH",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "937bd9c3-ffe9-4bac-8918-9a178ef3d488"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "HIGH"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.riskLevel }}",
+                    "rightValue": "MEDIUM",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "aba7fb93-82fd-4eea-be03-1ce0b90d94f9"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "MEDIUM"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.riskLevel }}",
+                    "rightValue": "LOW",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "25b39d01-acab-4616-aac5-e5951cdcc279"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "LOW"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.riskLevel }}",
+                    "rightValue": "CLEAN",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "3c5bce73-bb55-4e60-a63d-12f614af4b71"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "CLEAN"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "5acad543-8e77-4ed9-8c4f-7db8ab20b629",
+      "name": "Risk Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        2448,
+        -720
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "mohithasija77@gmail.com",
+        "subject": "=🚨 PII SECURITY ALERT - {{ $(\"Audit Report\").item.json.riskLevel }}",
+        "message": "=🚨 <strong>PII SECURITY ALERT</strong><br><br><strong>Scan ID:</strong> {{ $(\"Audit Report\").item.json.auditReport.reportId }}<br><strong>Risk Level:</strong> {{ $(\"Audit Report\").item.json.riskLevel }}<br><strong>PII Items Found:</strong> {{ $(\"Audit Report\").item.json.auditReport.detection.totalPiiFound }}<br><strong>Timestamp:</strong> {{ $(\"Audit Report\").item.json.auditReport.timestamp }}<br><br><strong>Breakdown:</strong><br>CRITICAL: {{ $(\"Audit Report\").item.json.auditReport.detection.findingsBySeverity.CRITICAL }}<br>HIGH: {{ $(\"Audit Report\").item.json.auditReport.detection.findingsBySeverity.HIGH }}<br>MEDIUM: {{ $(\"Audit Report\").item.json.auditReport.detection.findingsBySeverity.MEDIUM }}<br>LOW: {{ $(\"Audit Report\").item.json.auditReport.detection.findingsBySeverity.LOW }}<br><br>Action was taken: PII has been automatically masked.",
+        "options": {}
+      },
+      "id": "1ede7c9d-02b5-4cdb-84bd-8f24df837d4b",
+      "name": "Security Alert",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2672,
+        -768
+      ],
+      "webhookId": "fabef88f-4ce1-40cc-973b-63c5fa93157d",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "5XeyMr7aVTD6Uewx",
+          "name": "Gmail OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "documentId": {
+          "__rl": true,
+          "value": "1Qc6SK-ouUF-1IoczGsbJE0hgc5yHk536wD-n2EQBhxo",
+          "mode": "list",
+          "cachedResultName": "Audit Logs",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1Qc6SK-ouUF-1IoczGsbJE0hgc5yHk536wD-n2EQBhxo/edit?usp=drivesdk"
+        },
+        "options": {}
+      },
+      "id": "640eb39f-c7e4-43ac-9f2d-86e864f35fce",
+      "name": "Store Audit Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        2896,
+        -720
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "mt9NeStdjJcfeibS",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\n\nreturn [{\n  json: {\n    success: true,\n    \n    // ─── Core Result ───\n    scanId: data.auditReport.reportId,\n    riskLevel: data.riskLevel,\n    riskEmoji: data.riskEmoji,\n    cprsScore: data.cprsScore,\n    \n    // ─── Sanitized Output ───\n    sanitizedText: data.maskedText,\n    \n    // ─── Summary ───\n    piiDetected: data.auditReport.detection.totalPiiFound,\n    recommendedAction: data.auditReport.score.recommendedAction,\n    \n    message: data.cprsScore >= 70 \n      ? `🚨 CRITICAL: ${data.auditReport.detection.totalPiiFound} PII items detected. CPRS Score: ${data.cprsScore}/100. Identity theft risk: ${data.auditReport.complianceFlags.identityTheftRisk ? 'YES' : 'NO'}. All items masked.`\n      : data.cprsScore >= 40\n      ? `🔴 HIGH RISK: ${data.auditReport.detection.totalPiiFound} PII items detected. CPRS Score: ${data.cprsScore}/100. Items masked.`\n      : `⚠️ ${data.auditReport.detection.totalPiiFound} PII items detected and masked. CPRS Score: ${data.cprsScore}/100.`,\n    \n    // ─── Full Audit (optional — remove for production) ───\n    auditReport: data.auditReport,\n    \n    // ─── Compliance ───\n    compliance: data.auditReport.complianceFlags\n  }\n}];"
+      },
+      "id": "b86100fa-0f83-4596-a53a-711b198f5af9",
+      "name": "Final Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        -688
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Format Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI PII Analyzer",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Input": {
+      "main": [
+        [
+          {
+            "node": "Regex PII Scanner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Regex PII Scanner": {
+      "main": [
+        [
+          {
+            "node": "AI PII Analyzer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI PII Analyzer": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Findings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Findings": {
+      "main": [
+        [
+          {
+            "node": "Merge & Score Findings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge & Score Findings": {
+      "main": [
+        [
+          {
+            "node": "Needs Masking?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Masking?": {
+      "main": [
+        [
+          {
+            "node": "Apply PII Masking",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Clean — No PII",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply PII Masking": {
+      "main": [
+        [
+          {
+            "node": "Audit Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit Report": {
+      "main": [
+        [
+          {
+            "node": "Risk Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Risk Router": {
+      "main": [
+        [
+          {
+            "node": "Security Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Security Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Store Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Store Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Final Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Security Alert": {
+      "main": [
+        [
+          {
+            "node": "Store Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Audit Log": {
+      "main": [
+        [
+          {
+            "node": "Final Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Final Response": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "staticData": null,
+  "pinData": {},
+  "triggerCount": 0,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}
