@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PII Guard — Scan text for personal data</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #262b36;
+    --text: #e6e8ec; --muted: #9aa3b2; --accent: #5b8def;
+    --danger: #e5534b; --warn: #d9a441; --ok: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); padding: 32px 16px 64px;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin-bottom: 4px; }
+  .sub { color: var(--muted); margin-bottom: 28px; font-size: 0.95rem; }
+  label { display: block; font-size: 0.85rem; color: var(--muted); margin: 18px 0 6px; }
+  textarea, input {
+    width: 100%; background: var(--panel); border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 10px 12px; font-size: 0.95rem;
+    font-family: inherit;
+  }
+  textarea { min-height: 130px; resize: vertical; }
+  .hint { font-size: 0.78rem; color: var(--muted); margin-top: 4px; }
+  button {
+    margin-top: 22px; width: 100%; background: var(--accent); color: white;
+    border: none; border-radius: 8px; padding: 12px; font-size: 1rem; font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.6; cursor: default; }
+  #result { margin-top: 26px; display: none; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px; margin-top: 12px;
+  }
+  .risk { font-weight: 700; font-size: 1.1rem; }
+  .risk.LOW, .risk.CLEAN { color: var(--ok); }
+  .risk.MEDIUM { color: var(--warn); }
+  .risk.HIGH, .risk.CRITICAL { color: var(--danger); }
+  pre {
+    white-space: pre-wrap; word-break: break-word; background: #0c0e12;
+    border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 0.88rem;
+  }
+  .error { color: var(--danger); font-size: 0.9rem; margin-top: 12px; display: none; }
+  footer { margin-top: 40px; font-size: 0.8rem; color: var(--muted); text-align: center; }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🛡️ PII Guard</h1>
+  <p class="sub">Scan text for personal data, mask it, and see the risk breakdown — using your own OpenAI key.</p>
+
+  <label for="text">Text to scan</label>
+  <textarea id="text" placeholder="Paste an email, ticket, form submission, anything you want checked for PII..."></textarea>
+  <button id="pasteBtn" type="button" style="margin-top:6px; background:var(--panel); border:1px solid var(--border);">Paste from clipboard</button>
+
+  <label for="apiKey">Your OpenAI API key</label>
+  <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off">
+  <div class="hint">Sent directly to this one scan only — never stored, never logged. Get a key at platform.openai.com/api-keys.</div>
+
+  <button id="submitBtn">Scan for PII</button>
+  <div class="error" id="errorBox"></div>
+
+  <div id="result"></div>
+
+  <footer>
+    Self-host your own instance instead → <a href="https://github.com/mohithasija77/PII-Guard" target="_blank" rel="noopener">github.com/mohithasija77/PII-Guard</a>
+  </footer>
+</div>
+
+<script>
+  // Fill this in once your n8n instance is deployed somewhere public.
+  const WEBHOOK_URL = "http://localhost:5678/webhook/pii-scanner";
+
+  const btn = document.getElementById("submitBtn");
+  const resultBox = document.getElementById("result");
+  const errorBox = document.getElementById("errorBox");
+
+  document.getElementById("pasteBtn").addEventListener("click", async () => {
+    try {
+      const clip = await navigator.clipboard.readText();
+      document.getElementById("text").value = clip;
+    } catch {
+      showError("Couldn't read the clipboard — your browser may need permission, or just paste manually with Cmd/Ctrl+V.");
+    }
+  });
+
+  btn.addEventListener("click", async () => {
+    const text = document.getElementById("text").value.trim();
+    const apiKey = document.getElementById("apiKey").value.trim();
+
+    errorBox.style.display = "none";
+    resultBox.style.display = "none";
+
+    if (!text) { showError("Paste some text to scan first."); return; }
+    if (!apiKey) { showError("Your OpenAI API key is required — it's not stored anywhere, just used for this scan."); return; }
+    if (WEBHOOK_URL.includes("PASTE_YOUR")) { showError("This demo isn't wired up to a live backend yet."); return; }
+
+    btn.disabled = true;
+    btn.textContent = "Scanning...";
+
+    try {
+      const res = await fetch(WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, apiKey })
+      });
+
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      const data = await res.json();
+      renderResult(data);
+    } catch (err) {
+      showError("Something went wrong: " + err.message + " — check the browser console for details.");
+      console.error(err);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Scan for PII";
+    }
+  });
+
+  function showError(msg) {
+    errorBox.textContent = msg;
+    errorBox.style.display = "block";
+  }
+
+  function renderResult(data) {
+    const risk = data.riskLevel || "UNKNOWN";
+    resultBox.innerHTML = `
+      <div class="card">
+        <div class="risk ${risk}">${data.riskEmoji || ""} ${risk} RISK — CPRS ${data.cprsScore ?? "?"}/100</div>
+        <p>${escapeHtml(data.message || "")}</p>
+        <p><strong>PII items found:</strong> ${data.piiDetected ?? "?"}</p>
+      </div>
+      ${data.sanitizedText ? `
+      <div class="card">
+        <label style="margin-top:0">Masked output</label>
+        <pre id="maskedOutput">${escapeHtml(data.sanitizedText)}</pre>
+        <button id="copyBtn" type="button" style="margin-top:8px;">Copy masked text</button>
+      </div>` : ""}
+    `;
+    resultBox.style.display = "block";
+
+    const copyBtn = document.getElementById("copyBtn");
+    if (copyBtn) {
+      copyBtn.addEventListener("click", async () => {
+        await navigator.clipboard.writeText(data.sanitizedText);
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => { copyBtn.textContent = "Copy masked text"; }, 1500);
+      });
+    }
+  }
+
+  function escapeHtml(str) {
+    const d = document.createElement("div");
+    d.textContent = str;
+    return d.innerHTML;
+  }
+</script>
+</body>
+</html>
