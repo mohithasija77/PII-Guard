@@ -151,6 +151,13 @@
   details[open] .chev { transform: rotate(180deg); }
   .ai-body { padding: 0 14px 14px; }
   .ai-body p { margin: 0 0 10px; font-size: 0.82rem; color: var(--muted); line-height: 1.5; }
+  .provider-row { display: flex; gap: 8px; margin-bottom: 8px; }
+  select {
+    flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    border-radius: 10px; padding: 10px 12px; font: inherit; font-size: 0.88rem; cursor: pointer;
+  }
+  select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .detected { font-size: 0.76rem; color: var(--faint); margin-top: 6px; min-height: 1.1em; }
   .key-row { position: relative; }
   .key-row input { padding-right: 64px; font-family: var(--mono); font-size: 0.85rem; }
   .key-row button {
@@ -277,11 +284,24 @@
             <svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
           </summary>
           <div class="ai-body">
-            <p>Pattern matching already catches emails, phone numbers, card numbers and similar. Add your own AI key to also catch context-dependent data like names and addresses. The key is sent with this one scan only — never stored or logged.</p>
+            <p>Pattern matching already catches emails, phone numbers, cards, UK IDs, postcodes and common name patterns. Add a key from any major AI provider to also catch context-dependent data, like names in free text, towns and employers. The key is sent with this one scan only and is never stored.</p>
+            <div class="provider-row">
+              <select id="provider" aria-label="AI provider">
+                <option value="auto">Auto-detect provider</option>
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic (Claude)</option>
+                <option value="gemini">Google Gemini</option>
+                <option value="groq">Groq</option>
+                <option value="openrouter">OpenRouter</option>
+                <option value="mistral">Mistral</option>
+                <option value="deepseek">DeepSeek</option>
+              </select>
+            </div>
             <div class="key-row">
               <input id="apiKey" type="password" placeholder="Paste your AI provider key" autocomplete="off" spellcheck="false" aria-label="AI provider API key (optional)">
               <button class="ghost" id="toggleKey" type="button">Show</button>
             </div>
+            <div class="detected" id="detected"></div>
           </div>
         </details>
 
@@ -377,9 +397,23 @@ Sarah`;
   }
 
   function updateAiTag() {
-    const on = keyEl.value.trim().length > 0;
+    const key = keyEl.value.trim();
+    const on = key.length > 0;
     $("aiTag").textContent = on ? "On" : "Optional";
     $("aiTag").classList.toggle("on", on);
+
+    // Mirror the backend's prefix detection so people know which API their key will hit
+    let note = "";
+    if (on && $("provider").value === "auto") {
+      const guess = key.startsWith("sk-ant-") ? "Anthropic"
+        : key.startsWith("sk-or-") ? "OpenRouter"
+        : key.startsWith("gsk_") ? "Groq"
+        : key.startsWith("AIza") ? "Google Gemini"
+        : key.startsWith("sk-") ? "OpenAI (pick DeepSeek above if that's what this is)"
+        : "Unrecognised: pick your provider above";
+      note = "Detected: " + guess;
+    }
+    $("detected").textContent = note;
   }
 
   function toast(msg) {
@@ -409,6 +443,16 @@ Sarah`;
 
   // Highlight common mask formats: [EMAIL], [REDACTED_PHONE], <NAME>, ****, ***-**-1234, xxxx
   function highlightMasks(text) {
+    // Workflow's tag_only strategy returns <pii type="x">value</pii> — render those as tagged highlights
+    const parts = String(text).split(/(<pii type="[^"]*">[\s\S]*?<\/pii>)/g);
+    return parts.map((part) => {
+      const m = part.match(/^<pii type="([^"]*)">([\s\S]*?)<\/pii>$/);
+      if (m) return `<mark title="${escapeHtml(m[1])}">${escapeHtml(m[2])}</mark>`;
+      return highlightTokens(part);
+    }).join("");
+  }
+
+  function highlightTokens(text) {
     const safe = escapeHtml(text);
     return safe.replace(
       /(\[[A-Z0-9_ \-]{2,}\]|&lt;[A-Z0-9_ \-]{2,}&gt;|[*•Xx#]{3,}[\w\-*•]*)/g,
@@ -430,7 +474,10 @@ Sarah`;
     slowTimers.push(setTimeout(() => $("loadingNote").textContent = "Still waking up. Hang tight, this only happens on the first scan.", 25000));
 
     const payload = { text };
-    if (apiKey) payload.apiKey = apiKey;
+    if (apiKey) {
+      payload.apiKey = apiKey;
+      payload.provider = $("provider").value;
+    }
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 90000);
@@ -470,7 +517,13 @@ Sarah`;
     $("riskMsg").textContent = data.message || "";
     $("riskMsg").style.display = data.message ? "" : "none";
     $("piiCount").textContent = data.piiDetected ?? "–";
-    $("modeUsed").textContent = usedAi ? "Pattern + AI" : "Pattern";
+
+    // Backend reports whether AI actually ran; fall back to "did we send a key" for older backends
+    const ai = data.ai || { status: usedAi ? "ok" : "skipped" };
+    $("modeUsed").textContent = ai.status === "ok" ? "Pattern + AI" : ai.status === "failed" ? "Pattern only" : "Pattern";
+    if (ai.status === "failed") {
+      showError(`AI detection didn't run, so these results are pattern-only. ${String(ai.detail || "").replace(/^AI request failed:\s*/, "Provider said: ")}`);
+    }
 
     lastMasked = data.sanitizedText || "";
     const out = $("maskedOutput");
@@ -488,6 +541,7 @@ Sarah`;
   btn.addEventListener("click", scan);
   textEl.addEventListener("input", updateCount);
   keyEl.addEventListener("input", updateAiTag);
+  $("provider").addEventListener("change", updateAiTag);
   document.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && !btn.disabled) { e.preventDefault(); scan(); }
   });
